@@ -1,0 +1,143 @@
+
+DROP PROCEDURE  IF EXISTS generaNomina;
+
+DELIMITER //
+CREATE PROCEDURE generaNomina(IN v_idPerido INT )
+BEGIN
+	declare v_tot_dias int default 15;    
+    declare v_idEncabezado int default 0;    
+    declare v_idNomina int default 0; 
+    declare v_no_asiento int default 0; 
+       
+    select DATEDIFF(fecha_fin, fecha_inicio) +1 dias into v_tot_dias from rh_periodo;
+    select ifnull(max(idrh_dc_enc+1),0) into v_no_asiento from rh_dc_enc;
+    
+    select 
+		ifnull(idrh_dc_enc,0) into v_idEncabezado
+    from rh_periodo a 
+	inner join rh_dc_enc b on a.idnomina = b.idnomina and b.fecha between a.fecha_inicio and a.fecha_fin
+	where idrh_periodo = v_idPerido;
+    
+    /*Limpio las tablas de la generaciones anteriores de este periodo*/
+    if v_idEncabezado > 0 then 
+		delete from rh_dc_det where idrh_dc_enc = v_idEncabezado;
+        delete from rh_dc_enc where idrh_dc_enc = v_idEncabezado;
+    end if;
+   
+   /*Encabezado*/
+    insert into rh_dc_enc (idnomina, no_asiento,cod_diario,fecha,descripcion, credito, debito)
+	select
+		a.idnomina, v_no_asiento , b.codigo_nomina  , SYSDATE() , 
+		concat("Nomina ",a.descripcion," del ",DATE_FORMAT(a.fecha_inicio, "%d-%m-%Y")," al ",DATE_FORMAT(a.fecha_fin, "%d-%m-%Y")) 
+        ,0,0
+	from rh_periodo a
+	inner join rh_nomina b on a.idnomina = b.idrh_nomina
+	where idrh_periodo = v_idPerido;
+   
+    select last_insert_id() into v_idEncabezado;
+
+    /*Calculo del sueldo base*/   
+	insert into rh_dc_det (idrh_dc_enc, idempleado, idmovimiento, monto, cuenta_contable, fecha_desde, fecha_hasta)
+	select 
+		v_idEncabezado, e.idrh_empleado, c.idrh_movimiento, ifnull(e.sueldo,0) * v_tot_dias ,f.cuenta_contable, a.fecha_inicio, a.fecha_fin 
+	from rh_periodo a
+	inner join rh_movimiento c on c.idrh_movimiento = (select idrh_movimiento from rh_movimiento where lower(descripcion) like '%sueldo base%') and c.activo = 'Activa'
+	inner join rh_nomina d on a.idnomina = d.idrh_nomina
+	inner join rh_empleado e on d.idrh_nomina = e.idnomina and e.activo = 'Activa'
+	inner join rh_departamento f on e.iddepartamento = f.iddepartamento
+	where a.idrh_periodo = v_idPerido;
+    
+    /*Calculo el iggs*/
+    insert into rh_dc_det (idrh_dc_enc, idempleado, idmovimiento, monto, cuenta_contable, fecha_desde, fecha_hasta)
+    select 
+		v_idEncabezado, e.idrh_empleado, c.idrh_movimiento, (g.monto*(c.monto)*-1)/2 ,f.cuenta_contable, a.fecha_inicio, a.fecha_fin 
+	from rh_periodo a
+	inner join rh_movimiento c on c.idrh_movimiento = (select idrh_movimiento from rh_movimiento where lower(descripcion) like '%igss%') and c.activo = 'Activa'
+	inner join rh_empleado e on e.idnomina = a.idnomina and e.activo = 'Activa'
+	inner join rh_departamento f on e.iddepartamento = f.iddepartamento
+	inner join rh_dc_det g on g.idrh_dc_enc = v_idEncabezado and e.idrh_empleado = g.idempleado and g.idmovimiento = (select idrh_movimiento from rh_movimiento where lower(descripcion) like '%sueldo base%')
+	where a.idrh_periodo = v_idPerido;
+    
+    /*Calculo de ISR*/
+	insert into rh_dc_det (idrh_dc_enc, idempleado, idmovimiento, monto, cuenta_contable, fecha_desde, fecha_hasta)
+    select 
+	 v_idEncabezado, a.idrh_empleado, a.idrh_movimiento, ((montoDif * porc ) / 24)*-1 ,a.cuenta_contable, a.fecha_inicio, a.fecha_fin 
+	from (
+	select 
+		 e.idrh_empleado, c.idrh_movimiento, 
+         case when (g.monto*24) > 300000 then 0.07 else  0.05 end porc,  
+         /*Total ingresos(sueldo, bono, aguinaldo, bon decreto) - Total deducciones (48000(sin deducciones),  bono, aguinaldo, igss)*/
+         (g.monto*24 + g.monto*2 + g.monto*2)+(125*24) - (48000+(g.monto*2 + g.monto*2)+(h.monto*24*-1)) montoDif,
+         f.cuenta_contable, a.fecha_inicio, a.fecha_fin 
+	from rh_periodo a
+	inner join rh_movimiento c on c.idrh_movimiento = (select idrh_movimiento from rh_movimiento where lower(descripcion) like '%isr%') and c.activo = 'Activa'
+	inner join rh_empleado e on e.idnomina = a.idnomina and e.activo = 'Activa'
+	inner join rh_departamento f on e.iddepartamento = f.iddepartamento
+	inner join rh_dc_det g on g.idrh_dc_enc = v_idEncabezado and e.idrh_empleado = g.idempleado and g.idmovimiento = (select idrh_movimiento from rh_movimiento where lower(descripcion) like '%sueldo base%')
+	inner join rh_dc_det h on h.idrh_dc_enc = v_idEncabezado and e.idrh_empleado = h.idempleado and h.idmovimiento = (select idrh_movimiento from rh_movimiento where lower(descripcion) like '%igss%')
+	where a.idrh_periodo = v_idPerido
+	) a where montoDif >0;
+    
+    /*Movimientos de monto fijo automaticos*/
+    insert into rh_dc_det (idrh_dc_enc, idempleado, idmovimiento, monto, cuenta_contable, fecha_desde, fecha_hasta)
+	select
+	v_idEncabezado, e.idrh_empleado, c.idrh_movimiento, 
+	sum( case when c.tipo =  'EGRESO' then c.monto *-1 else c.monto end ) ,
+	f.cuenta_contable, a.fecha_inicio, a.fecha_fin 
+	from rh_periodo a
+	inner join rh_movimiento c on c.automatico ='S' and c.monto_fijo = 'S' and c.activo = 'Activa'
+	inner join rh_empleado e on e.idnomina = a.idnomina  and e.activo = 'Activa'
+	inner join rh_departamento f on e.iddepartamento = f.iddepartamento
+	where idrh_periodo = v_idPerido
+	group by e.idrh_empleado, c.idrh_movimiento, f.cuenta_contable, a.fecha_fin
+	;
+    
+    /*Movimientos de de monto fijo NO automaticos*/
+    insert into rh_dc_det (idrh_dc_enc, idempleado, idmovimiento, monto, cuenta_contable, fecha_desde, fecha_hasta)
+	select
+	v_idEncabezado, e.idrh_empleado, c.idrh_movimiento, 
+	sum( case when c.tipo =  'EGRESO' then b.monto *-1 else b.monto end ) ,
+	f.cuenta_contable, a.fecha_inicio, a.fecha_fin 
+	from rh_periodo a
+	inner join rh_ingreso_egreso b on b.fecha between a.fecha_inicio and a.fecha_fin
+    inner join rh_movimiento c on b.idmovimiento = c.idrh_movimiento and c.automatico ='N' and c.monto_fijo = 'S' and c.activo = 'Activa'
+	inner join rh_empleado e on e.idnomina = a.idnomina  and e.activo = 'Activa'
+	inner join rh_departamento f on e.iddepartamento = f.iddepartamento
+	where idrh_periodo = v_idPerido
+	group by e.idrh_empleado, c.idrh_movimiento, f.cuenta_contable, a.fecha_fin;
+    
+    /*Movimientos NO automaticos y que NO son montos fijos y que NO son % sobre base (CALCULO DE CANTIDAD * VALOR Ejemplo. Hora Extras)*/
+    insert into rh_dc_det (idrh_dc_enc, idempleado, idmovimiento, monto, cuenta_contable, fecha_desde, fecha_hasta)
+	select
+	v_idEncabezado, e.idrh_empleado, c.idrh_movimiento, 
+	sum( case when c.tipo =  'EGRESO' then b.monto *-1 * b.cantidad else b.monto*b.cantidad end ) ,
+	f.cuenta_contable, a.fecha_inicio, a.fecha_fin 
+	from rh_periodo a
+	inner join rh_ingreso_egreso b on b.fecha between a.fecha_inicio and a.fecha_fin
+    inner join rh_movimiento c on b.idmovimiento = c.idrh_movimiento and c.automatico ='N' and c.monto_fijo = 'N' and c.porc_sobre_base = 'N' and c.activo = 'Activa'
+	inner join rh_empleado e on e.idnomina = a.idnomina  and e.activo = 'Activa'
+	inner join rh_departamento f on e.iddepartamento = f.iddepartamento
+	where idrh_periodo = v_idPerido
+	group by e.idrh_empleado, c.idrh_movimiento, f.cuenta_contable, a.fecha_fin;
+    
+    /*Movimientos NO automaticos y que NO son montos fijos y que son % sobre base*/
+    insert into rh_dc_det (idrh_dc_enc, idempleado, idmovimiento, monto, cuenta_contable, fecha_desde, fecha_hasta)
+	select
+	v_idEncabezado, e.idrh_empleado, c.idrh_movimiento, 
+	sum( case when c.tipo =  'EGRESO' then g.monto *c.monto -1 else g.monto *c.monto end ) ,
+	f.cuenta_contable, a.fecha_inicio, a.fecha_fin 
+	from rh_periodo a
+    inner join rh_ingreso_egreso b on b.fecha between a.fecha_inicio and a.fecha_fin
+	inner join rh_movimiento c on b.idmovimiento = c.idrh_movimiento and c.automatico ='N' and c.monto_fijo = 'N' and c.porc_sobre_base = 'S' and c.activo = 'Activa'
+	inner join rh_empleado e on e.idnomina = a.idnomina  and e.activo = 'Activa'
+	inner join rh_departamento f on e.iddepartamento = f.iddepartamento
+    inner join rh_dc_det g on g.idrh_dc_enc = v_idEncabezado and e.idrh_empleado = g.idempleado and g.idmovimiento = (select idrh_movimiento from rh_movimiento where lower(descripcion) like '%sueldo base%')
+	where idrh_periodo = v_idPerido
+	group by e.idrh_empleado, c.idrh_movimiento, f.cuenta_contable, a.fecha_fin
+	;
+		
+	commit;
+    
+END //
+
+DELIMITER ;
